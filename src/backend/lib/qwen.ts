@@ -30,12 +30,24 @@ export async function runGuardrail(
     incomeTier: string;
   }
 ): Promise<GuardrailResult> {
+  const apiKey = import.meta.env.VITE_OPENAI_API_KEY;
+  const baseURL = import.meta.env.VITE_OPENAI_BASE_URL;
 
-  // initialize INSIDE the function so env vars are loaded at runtime
+  if (!apiKey) {
+    console.error("VITE_OPENAI_API_KEY is not set");
+    return escalateFallback("Missing OpenAI API key");
+  }
+
+  // dangerouslyAllowBrowser required when running in Vite/browser context
   const client = new OpenAI({
-  apiKey: import.meta.env.VITE_OPENAI_API_KEY,
-  baseURL: import.meta.env.VITE_OPENAI_BASE_URL,
-});
+    apiKey,
+    baseURL,
+    dangerouslyAllowBrowser: true,
+  });
+
+  // Safe baseline — avoids division-by-zero in template
+  const avgBaseline = context.userAvgTransaction > 0 ? context.userAvgTransaction : 100;
+  const amountDeviation = (context.amount / avgBaseline).toFixed(2);
 
   const prompt = `You are a financial fraud guardrail AI for GOGuardian, TNG eWallet Malaysia.
 
@@ -48,10 +60,10 @@ ACTUAL CONTEXT DATA (ground truth):
 - Receiver Name: ${context.receiverName}
 - XGBoost Risk Score: ${context.xgboostScore} (0=safe, 1=risky)
 - Receiver Strike Count: ${context.strikeCount}
-- User Average Transaction: RM${context.userAvgTransaction}
+- User Average Transaction: RM${avgBaseline}
 - User Age: ${context.age}
 - User Income Tier: ${context.incomeTier}
-- Amount Deviation: ${(context.amount / (context.userAvgTransaction || 100)).toFixed(2)}x baseline
+- Amount Deviation: ${amountDeviation}x baseline
 
 PRIMARY AI DECISION TO AUDIT:
 ${JSON.stringify(primaryDecision, null, 2)}
@@ -69,7 +81,7 @@ VERDICT RULES:
 - OVERRIDE: One or more checks failed. Force HOLD. Strip hallucinated reasoning.
 - ESCALATE: Deep contradiction or complete loss of confidence in primary AI output.
 
-Respond ONLY in this exact JSON format:
+Respond ONLY in this exact JSON format with no markdown or code fences:
 {
   "verdict": "PASS" | "OVERRIDE" | "ESCALATE",
   "finalDecision": "APPROVE" | "BLOCK" | "HOLD",
@@ -90,8 +102,9 @@ Respond ONLY in this exact JSON format:
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) throw new Error("No JSON in Qwen response");
 
-    const result = JSON.parse(jsonMatch[0]);
+    const result: GuardrailResult = JSON.parse(jsonMatch[0]);
 
+    // Enforce OVERRIDE always yields HOLD regardless of what model returns
     if (result.verdict === "OVERRIDE") {
       result.finalDecision = "HOLD";
     }
@@ -99,12 +112,17 @@ Respond ONLY in this exact JSON format:
     return result;
   } catch (error) {
     console.error("Qwen guardrail error:", error);
-    return {
-      verdict: "ESCALATE",
-      finalDecision: "HOLD",
-      reason: "Guardrail layer failed — defaulting to HOLD for safety",
-      reasonBM: "Sistem pengesahan tidak dapat berfungsi. Transaksi ditahan buat sementara.",
-      guardrailNotes: `Guardrail error: ${error}`,
-    };
+    return escalateFallback(`Guardrail error: ${error}`);
   }
+}
+
+function escalateFallback(notes: string): GuardrailResult {
+  return {
+    verdict: "ESCALATE",
+    finalDecision: "HOLD",
+    reason: "Guardrail layer failed — defaulting to HOLD for safety",
+    reasonBM:
+      "Sistem pengesahan tidak dapat berfungsi. Transaksi ditahan buat sementara.",
+    guardrailNotes: notes,
+  };
 }

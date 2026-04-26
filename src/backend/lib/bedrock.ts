@@ -30,10 +30,27 @@ export interface BedrockDecision {
 export async function invokeGuardianLLM(
   context: TransactionContext
 ): Promise<BedrockDecision> {
+  // AWS SDK in browser requires explicit credentials from VITE_ env vars.
+  // The SDK cannot read AWS_* vars directly — those only work in Node/Lambda.
+  const accessKeyId = import.meta.env.VITE_AWS_ACCESS_KEY_ID;
+  const secretAccessKey = import.meta.env.VITE_AWS_SECRET_ACCESS_KEY;
+  const sessionToken = import.meta.env.VITE_AWS_SESSION_TOKEN;
+  const region = import.meta.env.VITE_AWS_REGION ?? "ap-southeast-1";
 
-  // initialize inside function so it picks up runtime credentials
+  if (!accessKeyId || !secretAccessKey) {
+    console.error(
+      "AWS credentials missing. Ensure VITE_AWS_ACCESS_KEY_ID and VITE_AWS_SECRET_ACCESS_KEY are set."
+    );
+    return holdFallback("Missing AWS credentials");
+  }
+
   const client = new BedrockRuntimeClient({
-    region: "ap-southeast-1",
+    region,
+    credentials: {
+      accessKeyId,
+      secretAccessKey,
+      ...(sessionToken ? { sessionToken } : {}),
+    },
   });
 
   const prompt = `You are GOGuardian, a financial fraud protection AI for TNG eWallet Malaysia.
@@ -57,7 +74,7 @@ Rules:
 - If receiver name is a known shop/business, lean toward APPROVE
 - Always explain in simple Bahasa Malaysia for elderly users
 
-Respond ONLY in this exact JSON format:
+Respond ONLY in this exact JSON format with no markdown or code fences:
 {
   "decision": "APPROVE" | "BLOCK" | "HOLD",
   "confidence": 0.0-1.0,
@@ -87,18 +104,32 @@ Respond ONLY in this exact JSON format:
   try {
     const response = await client.send(command);
     const raw = JSON.parse(new TextDecoder().decode(response.body));
-    const text = raw.output.message.content[0].text;
+    const text: string = raw.output.message.content[0].text;
+
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("No JSON found in response");
-    return JSON.parse(jsonMatch[0]);
+    if (!jsonMatch) throw new Error("No JSON found in Bedrock response");
+
+    const parsed: BedrockDecision = JSON.parse(jsonMatch[0]);
+
+    // Validate required fields before returning
+    if (!["APPROVE", "BLOCK", "HOLD"].includes(parsed.decision)) {
+      throw new Error(`Invalid decision value: ${parsed.decision}`);
+    }
+
+    return parsed;
   } catch (error) {
     console.error("Bedrock LLM error:", error);
-    return {
-      decision: "HOLD",
-      confidence: 0.5,
-      evidence_used: [],
-      reason: "LLM response parsing failed, defaulting to HOLD for safety",
-      reasonBM: "Sistem tidak dapat mengesahkan transaksi ini. Sila tunggu kelulusan penjaga anda.",
-    };
+    return holdFallback(`LLM response parsing failed: ${error}`);
   }
+}
+
+function holdFallback(reason: string): BedrockDecision {
+  return {
+    decision: "HOLD",
+    confidence: 0.5,
+    evidence_used: [],
+    reason,
+    reasonBM:
+      "Sistem tidak dapat mengesahkan transaksi ini. Sila tunggu kelulusan penjaga anda.",
+  };
 }
